@@ -3,12 +3,12 @@ import random as rd
 import scipy.sparse as sp
 from time import time
 import json
-from codes.utility.parser import parse_args
+import torch
+import sys
+from torch_geometric.data import HeteroData
+from utility.parser import parse_args
 
 args = parse_args()
-
-import torch
-
 
 
 class Data(object):
@@ -24,20 +24,32 @@ class Data(object):
         self.n_users, self.n_items = 0, 0
         self.n_train, self.n_test, self.n_val = 0, 0, 0
         self.neg_pools = {}
-
         self.exist_users = []
 
-        train = json.load(open(train_file))
-        test = json.load(open(test_file))
-        val = json.load(open(val_file))
+        # [新增] 用于构建 PyG edge_index 的列表
+        self.trainUser = []
+        self.trainItem = []
+
+        try:
+            train = json.load(open(train_file))
+            test = json.load(open(test_file))
+            val = json.load(open(val_file))
+        except Exception as e:
+            print(f"Error loading JSON files: {e}")
+            sys.exit(1)
+
         for uid, items in train.items():
-            if len(items) == 0:
-                continue
+            if len(items) == 0: continue
             uid = int(uid)
             self.exist_users.append(uid)
             self.n_items = max(self.n_items, max(items))
             self.n_users = max(self.n_users, uid)
             self.n_train += len(items)
+
+            # [新增] 填充交互列表，用于 PyG
+            for i in items:
+                self.trainUser.append(uid)
+                self.trainItem.append(i)
 
         for uid, items in test.items():
             uid = int(uid)
@@ -61,22 +73,18 @@ class Data(object):
         self.print_statistics()
 
         self.R = sp.dok_matrix((self.n_users, self.n_items), dtype=np.float32)
-        self.R_Item_Interacts = sp.dok_matrix((self.n_items, self.n_items), dtype=np.float32)
 
         self.train_items, self.test_set, self.val_set = {}, {}, {}
         for uid, train_items in train.items():
-            if len(train_items) == 0:
-                continue
+            if len(train_items) == 0: continue
             uid = int(uid)
             for idx, i in enumerate(train_items):
                 self.R[uid, i] = 1.
-
             self.train_items[uid] = train_items
 
         for uid, test_items in test.items():
             uid = int(uid)
-            if len(test_items) == 0:
-                continue
+            if len(test_items) == 0: continue
             try:
                 self.test_set[uid] = test_items
             except:
@@ -84,12 +92,27 @@ class Data(object):
 
         for uid, val_items in val.items():
             uid = int(uid)
-            if len(val_items) == 0:
-                continue
+            if len(val_items) == 0: continue
             try:
                 self.val_set[uid] = val_items
             except:
                 continue
+
+        # [新增] 预加载模态特征，供 HeteroMMHAC 模型初始化使用
+        self._load_features()
+
+    def _load_features(self):
+        print("Loading raw features for model init...")
+        try:
+            # 尝试加载 npy 文件
+            self.v_feat = np.load(f'../data/{args.dataset}/image_feat.npy')
+            self.t_feat = np.load(f'../data/{args.dataset}/text_feat.npy')
+            print(f"Features loaded: Visual {self.v_feat.shape}, Text {self.t_feat.shape}")
+        except Exception as e:
+            print(f"Warning: Could not load features (.npy). using random init. Error: {e}")
+            # Fallback: 生成随机特征防止报错，或者报错退出
+            self.v_feat = np.random.randn(self.n_items, args.embed_size)
+            self.t_feat = np.random.randn(self.n_items, args.embed_size)
 
     def sparse_mx_to_torch_sparse_tensor(self, sparse_mx):
         """Convert a scipy sparse matrix to a torch sparse tensor."""
@@ -98,8 +121,6 @@ class Data(object):
             np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
         values = torch.from_numpy(sparse_mx.data)
         shape = torch.Size(sparse_mx.shape)
-
-        # [修改] 使用 torch.sparse_coo_tensor 替代过时的 FloatTensor
         return torch.sparse_coo_tensor(indices, values, shape, dtype=torch.float32)
 
     def print_statistics(self):
@@ -113,8 +134,6 @@ class Data(object):
             users = rd.sample(self.exist_users, self.batch_size)
         else:
             users = [rd.choice(self.exist_users) for _ in range(self.batch_size)]
-
-        # users = self.exist_users[:]
 
         def sample_pos_items_for_u(u, num):
             pos_items = self.train_items[u]
@@ -138,82 +157,13 @@ class Data(object):
                     neg_items.append(neg_id)
             return neg_items
 
-        def sample_neg_items_for_u_from_pools(u, num):
-            neg_items = list(set(self.neg_pools[u]) - set(self.train_items[u]))
-            return rd.sample(neg_items, num)
-
         pos_items, neg_items = [], []
         for u in users:
             pos_items += sample_pos_items_for_u(u, 1)
             neg_items += sample_neg_items_for_u(u, 1)
-            # neg_items += sample_neg_items_for_u(u, 3)
         return users, pos_items, neg_items
 
-    # 原始的Latiice
-    # general Model 返回的是numpy类型的，度归一化用-1
-    def get_adj_mat(self):
-        try:
-            t1 = time()
-            adj_mat = sp.load_npz(self.path + '/s_adj_mat.npz')
-            norm_adj_mat = sp.load_npz(self.path + '/s_norm_adj_mat.npz')
-            mean_adj_mat = sp.load_npz(self.path + '/s_mean_adj_mat.npz')
-            print('already load adj matrix', adj_mat.shape, time() - t1)
-
-        except Exception:
-            adj_mat, norm_adj_mat, mean_adj_mat = self.create_adj_mat()
-            sp.save_npz(self.path + '/s_adj_mat.npz', adj_mat)
-            sp.save_npz(self.path + '/s_norm_adj_mat.npz', norm_adj_mat)
-            sp.save_npz(self.path + '/s_mean_adj_mat.npz', mean_adj_mat)
-        return adj_mat, norm_adj_mat, mean_adj_mat
-
-    def create_adj_mat(self):
-        t1 = time()
-        adj_mat = sp.dok_matrix((self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32)
-        adj_mat = adj_mat.tolil()
-        R = self.R.tolil()
-
-        adj_mat[:self.n_users, self.n_users:] = R
-        adj_mat[self.n_users:, :self.n_users] = R.T
-        adj_mat = adj_mat.todok()
-        print('already create adjacency matrix', adj_mat.shape, time() - t1)
-
-        t2 = time()
-
-        def normalized_adj_single(adj):
-            rowsum = np.array(adj.sum(1))
-
-            d_inv = np.power(rowsum, -1).flatten()
-            d_inv[np.isinf(d_inv)] = 0.
-            d_mat_inv = sp.diags(d_inv)
-
-            norm_adj = d_mat_inv.dot(adj)
-            # norm_adj = adj.dot(d_mat_inv)
-            print('generate single-normalized adjacency matrix.')
-            return norm_adj.tocoo()
-
-        def get_D_inv(adj):
-            rowsum = np.array(adj.sum(1))
-
-            d_inv = np.power(rowsum, -1).flatten()
-            d_inv[np.isinf(d_inv)] = 0.
-            d_mat_inv = sp.diags(d_inv)
-            return d_mat_inv
-
-        def check_adj_if_equal(adj):
-            dense_A = np.array(adj.todense())
-            degree = np.sum(dense_A, axis=1, keepdims=False)
-
-            temp = np.dot(np.diag(np.power(degree, -1)), dense_A)
-            print('check normalized adjacency matrix whether equal to this laplacian matrix.')
-            return temp
-
-        norm_adj_mat = normalized_adj_single(adj_mat + sp.eye(adj_mat.shape[0]))
-        mean_adj_mat = normalized_adj_single(adj_mat)
-
-        print('already normalize adjacency matrix', time() - t2)
-        return adj_mat.tocsr(), norm_adj_mat.tocsr(), mean_adj_mat.tocsr()
-
-    # ---------------------------------------Own--------------------------------------------------
+    # --------------------------------------- Graph Construction --------------------------------------------------
 
     def norm_dense(self, adj, normalization='origin'):
         if normalization == 'sym':
@@ -222,19 +172,6 @@ class Data(object):
             d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
             d_mat_inv_sqrt = torch.diagflat(d_inv_sqrt)
             L_norm = torch.mm(torch.mm(d_mat_inv_sqrt, adj), d_mat_inv_sqrt)
-        elif normalization == "2sym":
-            rowsum = torch.sum(adj, -1)
-            d_row_inv_sqrt = torch.pow(rowsum, -0.5)
-            d_row_inv_sqrt[torch.isinf(d_row_inv_sqrt)] = 0.
-            d_row_mat_inv_sqrt = torch.diagflat(d_row_inv_sqrt)
-
-            colsum = torch.sum(adj, -2)
-            d_col_inv_sqrt = torch.pow(colsum, -0.5)
-            d_col_inv_sqrt[torch.isinf(d_col_inv_sqrt)] = 0.
-            d_col_mat_inv_sqrt = torch.diagflat(d_col_inv_sqrt)
-
-            L_norm = torch.mm(torch.mm(d_row_mat_inv_sqrt, adj), d_col_mat_inv_sqrt)
-
         elif normalization == 'rw':
             rowsum = torch.sum(adj, -1)
             d_inv = torch.pow(rowsum, -1)
@@ -246,7 +183,7 @@ class Data(object):
         return L_norm
 
     # ============================================================================
-    # [新增] 内存安全的核心工具函数 (请添加到 Data 类中)
+    # 内存安全的核心工具函数 (分块构建 KNN)
     # ============================================================================
     def build_knn_sparse_batch(self, features, topk, batch_size=2048):
         """
@@ -311,135 +248,47 @@ class Data(object):
             d_mat_inv = sp.diags(d_inv)
             norm_adj = d_mat_inv.dot(adj)
         else:
-            raise NotImplementedError(f"Norm type {norm_type} not implemented for sparse.")
+            norm_adj = adj
         return norm_adj.tocoo()
 
     # ============================================================================
-    # [替换] 下面两个函数替换原来的同名函数
+    # 获取各种图结构 (UI, I2I, Hypergraph)
     # ============================================================================
-    def get_I2I_Hypergrah_mat(self, norm_type="origin"):
-        # [修改] 使用内存高效的方式构建多模态超图
-        print(f"Loading I2I multi-media Hypergraph mat:({norm_type})_topk:{str(args.topk)}")
-        t = time()
-        try:
-            Hypergraph = torch.load(f"{self.path}/hypergraph_mat_{norm_type}_topk_{str(args.topk)}.pth")
-        except Exception:
-            print("Generating Hypergraph from scratch (Batch Mode)...")
-
-            image_feats = np.load(f'../data/{args.dataset}/image_feat.npy')
-            text_feats = np.load(f'../data/{args.dataset}/text_feat.npy')
-            image_feats = torch.tensor(image_feats).float()
-            text_feats = torch.tensor(text_feats).float()
-
-            # [关键] 调用分块构建
-            image_adj = self.build_knn_sparse_batch(image_feats, topk=args.topk)
-            text_adj = self.build_knn_sparse_batch(text_feats, topk=args.topk)
-
-            # 稀疏拼接
-            Hypergraph = sp.hstack([image_adj, text_adj])
-            Hypergraph = self.norm_sparse(Hypergraph, norm_type)
-
-            # 转 Torch Sparse
-            indices = torch.from_numpy(np.vstack((Hypergraph.row, Hypergraph.col)).astype(np.int64))
-            values = torch.from_numpy(Hypergraph.data).float()
-            shape = torch.Size(Hypergraph.shape)
-            Hypergraph = torch.sparse_coo_tensor(indices, values, shape, dtype=torch.float32)
-
-            torch.save(Hypergraph, f"{self.path}/hypergraph_mat_{norm_type}_topk_{str(args.topk)}.pth")
-
-        print("End Load I2I multi-media Hypergraph mat:[%.1fs](" % (time() - t) + norm_type + ")")
-        return Hypergraph
-
-    def get_I2I_Hypergraph_mul_mat(self, norm_type="sym"):
-        # [修改] 全程稀疏计算 H * H^T
-        print(f"Loading I2I multi-media Hypergraph mul mat*mat.T:({norm_type})_topk:{str(args.topk)}")
-        t = time()
-        try:
-            Hypergraph_mul = torch.load(f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth")
-        except Exception:
-            print("Generating Hypergraph_mul from scratch (Sparse Mode)...")
-
-            # 1. 获取 H (Torch Sparse)
-            H_torch = self.get_I2I_Hypergrah_mat("origin")
-
-            # 2. 转 Scipy Sparse
-            H_indices = H_torch.coalesce().indices().cpu().numpy()
-            H_values = H_torch.coalesce().values().cpu().numpy()
-            H_shape = H_torch.size()
-            H_scipy = sp.coo_matrix((H_values, (H_indices[0], H_indices[1])), shape=H_shape)
-
-            # 3. 稀疏矩阵乘法 (内存极其高效)
-            H_csr = H_scipy.tocsr()
-            H_mul_scipy = H_csr.dot(H_csr.transpose())
-
-            # 4. 归一化
-            H_mul_scipy = self.norm_sparse(H_mul_scipy, norm_type)
-
-            # 5. 转回 Torch Sparse
-            H_mul_coo = H_mul_scipy.tocoo()
-            indices = torch.from_numpy(np.vstack((H_mul_coo.row, H_mul_coo.col)).astype(np.int64))
-            values = torch.from_numpy(H_mul_coo.data).float()
-            shape = torch.Size(H_mul_coo.shape)
-
-            Hypergraph_mul = torch.sparse_coo_tensor(indices, values, shape, dtype=torch.float32)
-
-            torch.save(Hypergraph_mul, f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth")
-
-        print("End Load I2I multi-media Hypergraph mul mat*mat.T:[%.1fs](" % (time() - t) + norm_type + ")")
-        return Hypergraph_mul
 
     def get_UI_mat(self, norm_type='sym'):
         """
-        [Fix] 针对大规模数据集（如 Sports/Clothing）优化内存。
-        使用 scipy.sparse 进行稀疏矩阵归一化，避免 .todense() 导致的 11GB+ 内存溢出。
+        [Memory Optimized] 获取 User-Item 交互矩阵 (用于 LightGCN 骨架)
+        使用 scipy.sparse 进行归一化，避免 todense() OOM
         """
         print("Loading UI_mat:(" + norm_type + ")")
         t = time()
 
-        # 尝试加载缓存
         try:
-            # 尝试加载已保存的稀疏张量
             UI_mat = torch.load(self.path + '/UI_mat_' + norm_type + ".pth")
         except Exception:
             print(f"Generating UI_mat from scratch (Sparse Mode)...")
-            # 1. 构建基础邻接矩阵 (dok_matrix -> csr_matrix)
-            # 矩阵大小: (users + items) x (users + items)
-            n_nodes = self.n_users + self.n_items
-
-            # 使用 scipy.sparse.bmat 快速构建大矩阵，或者手动构建 data/row/col
-            # 这里沿用原逻辑但避免 todense
             R = self.R.tocsr()  # (n_users, n_items)
 
             # 构造大矩阵 A = [[0, R], [R.T, 0]]
-            # 使用 scipy.sparse.vstack 和 hstack 组合
             # Top part: [Zero(n_u, n_u), R]
             top = sp.hstack([sp.csr_matrix((self.n_users, self.n_users)), R])
             # Bottom part: [R.T, Zero(n_i, n_i)]
             bottom = sp.hstack([R.T, sp.csr_matrix((self.n_items, self.n_items))])
-            adj_mat = sp.vstack([top, bottom]).tocsr()  # 此时是 CSR 格式的稀疏矩阵
+            adj_mat = sp.vstack([top, bottom]).tocsr()
 
-            # [Fix] 关键修正：添加自环 (Self-Loop)
-            # 对应 GCN 公式中的 (A + I)
-            # 如果不加这一行，节点特征会丢失自身信息，导致欠拟合
+            # 添加自环 (Self-Loop): A + I
             adj_mat = adj_mat + sp.eye(adj_mat.shape[0])
 
-            # 2. 稀疏归一化 (Symmetric Normalization: D^-0.5 * A * D^-0.5)
+            # 稀疏归一化
             if norm_type == 'sym':
-                # 计算度数 (行求和)
                 rowsum = np.array(adj_mat.sum(1))
-
-                # 计算 D^-0.5
                 d_inv_sqrt = np.power(rowsum, -0.5).flatten()
                 d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
                 d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
-
-                # 稀疏矩阵乘法: (D^-0.5 * A) * D^-0.5
                 norm_adj = d_mat_inv_sqrt.dot(adj_mat).dot(d_mat_inv_sqrt)
-
-                # 转换为 COO 格式以便创建 Torch Sparse Tensor
                 norm_adj = norm_adj.tocoo()
 
-            elif norm_type == 'rw':  # Random Walk Normalization
+            elif norm_type == 'rw':
                 rowsum = np.array(adj_mat.sum(1))
                 d_inv = np.power(rowsum, -1).flatten()
                 d_inv[np.isinf(d_inv)] = 0.
@@ -448,275 +297,195 @@ class Data(object):
             else:
                 norm_adj = adj_mat.tocoo()
 
-            # 3. 转换为 PyTorch Sparse Tensor
+            # 转换为 PyTorch Sparse Tensor
             indices = torch.from_numpy(np.vstack((norm_adj.row, norm_adj.col)).astype(np.int64))
             values = torch.from_numpy(norm_adj.data).float()
             shape = torch.Size(norm_adj.shape)
-            UI_mat = torch.sparse.FloatTensor(indices, values, shape)
+            UI_mat = torch.sparse_coo_tensor(indices, values, shape, dtype=torch.float32)
 
-            # 4. 保存缓存
             print("Saving UI_mat to cache...")
             torch.save(UI_mat, self.path + '/UI_mat_' + norm_type + ".pth")
 
         print("End Load UI_mat:[%.1fs](" % (time() - t) + norm_type + ")")
         return UI_mat
 
-    def get_UI_single_mat(self, norm_type='2sym'):
-        print("Loading UI_single_mat:(" + norm_type + ")")
-        t = time()
-        try:
-            UI_mat = torch.load(self.path + '/UI_single_mat_' + norm_type + ".pth")
-        except Exception:
-            adj_mat = self.R.todense()
-            UI_mat = torch.from_numpy(adj_mat).float()
-            UI_mat = self.norm_dense(UI_mat, norm_type)
-            UI_mat = UI_mat.to_sparse()
-            torch.save(UI_mat, self.path + '/UI_single_mat_' + norm_type + ".pth")
-        print("End Load UI_single_mat:[%.1fs](" % (time() - t) + norm_type + ")")
-        return UI_mat
-
     def get_U2U_mat(self, norm_type='rw'):
-        # U2U_mat default use row normalization,and No-self-connection
         print("Loading User_mat:(" + norm_type + ")")
         t = time()
         try:
             User_mat = torch.load(self.path + '/User_mat_' + norm_type + ".pth")
         except Exception:
-            # [优化] 始终使用稀疏矩阵计算
-            R = self.R.tocsr()  # 转为 CSR 格式
-            User_mat = R.dot(R.T)  # 稀疏矩阵乘法，结果仍为稀疏矩阵
-
-            # 移除对角线 (自连接)
+            R = self.R.tocsr()
+            User_mat = R.dot(R.T)
             User_mat.setdiag(0)
-            User_mat.eliminate_zeros()  # 清理零元素
+            User_mat.eliminate_zeros()
 
-            # 归一化
             rowsum = np.array(User_mat.sum(1))
             d_inv = np.power(rowsum, -1).flatten()
             d_inv[np.isinf(d_inv)] = 0.
             d_mat_inv = sp.diags(d_inv)
             User_mat = d_mat_inv.dot(User_mat).tocoo()
 
-            # 转 Tensor
             indices = torch.from_numpy(np.vstack((User_mat.row, User_mat.col)).astype(np.int64))
             values = torch.from_numpy(User_mat.data).float()
             shape = torch.Size(User_mat.shape)
-            User_mat = torch.sparse.FloatTensor(indices, values, shape)
+            User_mat = torch.sparse_coo_tensor(indices, values, shape, dtype=torch.float32)
 
             torch.save(User_mat, self.path + '/User_mat_' + norm_type + ".pth")
         print("End Load User_mat:[%.1fs](" % (time() - t) + norm_type + ")")
         return User_mat
 
     def get_I2I_single_mat(self, norm_type="sym"):
-        # I2I_mat default use sym normalization,and must have self-connection because of similarity
-        print("Loading I2I media-specific mat:(" + norm_type + ")")
+        """
+        获取单模态的 KNN 稀疏图 (Image, Text)
+        """
+        # [修改 1] 在打印日志中加入 topk 信息
+        print(f"Loading I2I media-specific mat:({norm_type})_topk:{args.topk}")
         t = time()
+
+        # [修改 2] 将 args.topk 加入文件名，防止缓存冲突
+        img_path = f"{self.path}/Image_mat_{norm_type}_topk_{args.topk}.pth"
+        txt_path = f"{self.path}/Text_mat_{norm_type}_topk_{args.topk}.pth"
+        aud_path = f"{self.path}/Audio_mat_{norm_type}_topk_{args.topk}.pth"
+
         try:
-            image_adj = torch.load(self.path + '/Image_mat_' + norm_type + ".pth")
-            text_adj = torch.load(self.path + '/Text_mat_' + norm_type + ".pth")
-            if args.dataset=="tiktok":
-                audio_adj = torch.load(self.path + '/Audio_mat_' + norm_type + ".pth")
-
+            image_adj = torch.load(img_path)
+            text_adj = torch.load(txt_path)
+            if args.dataset == "tiktok":
+                audio_adj = torch.load(aud_path)
         except Exception:
-            # image_feats = np.load('../data/old/{}/image_feat.npy'.format(args.dataset))  # '../data/{}/image_feat.npy'
-            image_feats = np.load('../data/{}/image_feat.npy'.format(args.dataset))  # '../data/{}/image_feat.npy'
-            # text_feats = np.load('../data/old/{}/text_feat.npy'.format(args.dataset))
-            text_feats = np.load('../data/{}/text_feat.npy'.format(args.dataset))
+            print("Generating I2I Single Mats from scratch...")
+
+            if not hasattr(self, 'v_feat'): self._load_features()
+
+            # 1. Visual
+            v_feat_torch = torch.tensor(self.v_feat).float()
+            image_adj_sp = self.build_knn_sparse_batch(v_feat_torch, topk=args.topk)
+            image_adj_sp = self.norm_sparse(image_adj_sp, norm_type)
+
+            i_indices = torch.from_numpy(np.vstack((image_adj_sp.row, image_adj_sp.col)).astype(np.int64))
+            i_values = torch.from_numpy(image_adj_sp.data).float()
+            image_adj = torch.sparse_coo_tensor(i_indices, i_values, torch.Size(image_adj_sp.shape))
+
+            # 2. Textual
+            t_feat_torch = torch.tensor(self.t_feat).float()
+            text_adj_sp = self.build_knn_sparse_batch(t_feat_torch, topk=args.topk)
+            text_adj_sp = self.norm_sparse(text_adj_sp, norm_type)
+
+            t_indices = torch.from_numpy(np.vstack((text_adj_sp.row, text_adj_sp.col)).astype(np.int64))
+            t_values = torch.from_numpy(text_adj_sp.data).float()
+            text_adj = torch.sparse_coo_tensor(t_indices, t_values, torch.Size(text_adj_sp.shape))
+
             if args.dataset == "tiktok":
-                # audio_feats = np.load('../data/old/{}/audio_feat.npy'.format(args.dataset))
-                audio_feats = np.load('../data/{}/audio_feat.npy'.format(args.dataset))
+                try:
+                    audio_feats = np.load(f'../data/{args.dataset}/audio_feat.npy')
+                    a_feat_torch = torch.tensor(audio_feats).float()
+                    audio_adj_sp = self.build_knn_sparse_batch(a_feat_torch, topk=args.topk)
+                    audio_adj_sp = self.norm_sparse(audio_adj_sp, norm_type)
 
-            image_feats = torch.tensor(image_feats).float()
-            text_feats = torch.tensor(text_feats).float()
-            if args.dataset == "tiktok":
-                audio_feats = torch.tensor(audio_feats).float()
+                    a_indices = torch.from_numpy(np.vstack((audio_adj_sp.row, audio_adj_sp.col)).astype(np.int64))
+                    a_values = torch.from_numpy(audio_adj_sp.data).float()
+                    audio_adj = torch.sparse_coo_tensor(a_indices, a_values, torch.Size(audio_adj_sp.shape))
+                    torch.save(audio_adj, aud_path)
+                except:
+                    audio_adj = None
 
-            image_adj = self.build_sim(image_feats)
-            image_adj = self.build_knn_normalized_graph(image_adj, topk=args.topk)
+            # [修改 3] 按新的带 topk 的路径保存
+            torch.save(image_adj, img_path)
+            torch.save(text_adj, txt_path)
 
-            text_adj = self.build_sim(text_feats)
-            text_adj = self.build_knn_normalized_graph(text_adj, topk=args.topk)
-            if args.dataset == "tiktok":
-                audio_adj = self.build_sim(audio_feats)
-                audio_adj = self.build_knn_normalized_graph(audio_adj, topk=args.topk)
+        print(f"End Load I2I media-specific mat:[{time() - t:.1f}s]({norm_type})")
 
-            image_adj = self.norm_dense(image_adj, norm_type)
-            text_adj = self.norm_dense(text_adj, norm_type)
-            if args.dataset == "tiktok":
-                audio_adj = self.norm_dense(audio_adj, norm_type)
-
-
-            image_adj = image_adj.to_sparse()
-            text_adj = text_adj.to_sparse()
-            if args.dataset == "tiktok":
-                audio_adj = audio_adj.to_sparse()
-
-
-            torch.save(image_adj, self.path + '/Image_mat_' + norm_type + ".pth")
-            torch.save(text_adj, self.path + '/Text_mat_' + norm_type + ".pth")
-            if args.dataset == "tiktok":
-                torch.save(audio_adj, self.path + '/Audio_mat_' + norm_type + ".pth")
-
-        print("End Load I2I media-specific mat:[%.1fs](" % (time() - t) + norm_type + ")")
         if args.dataset == "tiktok":
             return image_adj, text_adj, audio_adj
         else:
-            return image_adj, text_adj, ""
+            return image_adj, text_adj, None
 
-    # Order to speed up when Model forward this is be replaced
-    # def get_I2I_Hypergrah_mat(self, norm_type="origin"):
-    #     # I2I_Hypergraph_mat use origin normalization
-    #     print(f"Loading I2I multi-media Hypergraph mat:({norm_type})_topk:{str(args.topk)}")
-    #     t = time()
-    #     try:
-    #         Hypergraph = torch.load(f"{self.path}/hypergraph_mat_{norm_type}_topk_{str(args.topk)}.pth")
-    #     except Exception:
-    #         # image_feats = np.load('../data/old/{}/image_feat.npy'.format(args.dataset))  # '../data/{}/image_feat.npy'
-    #         # text_feats = np.load('../data/old/{}/text_feat.npy'.format(args.dataset))
-    #         image_feats = np.load('../data/{}/image_feat.npy'.format(args.dataset))  # '../data/{}/image_feat.npy'
-    #         text_feats = np.load('../data/{}/text_feat.npy'.format(args.dataset))
-    #
-    #         image_feats = torch.tensor(image_feats).float()
-    #         text_feats = torch.tensor(text_feats).float()
-    #
-    #         image_adj = self.build_sim(image_feats)
-    #         image_adj = self.build_knn_normalized_graph(image_adj, topk=args.topk)
-    #
-    #         text_adj = self.build_sim(text_feats)
-    #         text_adj = self.build_knn_normalized_graph(text_adj, topk=args.topk)
-    #
-    #         Hypergraph = torch.cat((image_adj, text_adj), dim=1)
-    #         Hypergraph = self.norm_dense(Hypergraph, norm_type)
-    #         Hypergraph = Hypergraph.to_sparse()
-    #         torch.save(Hypergraph, f"{self.path}/hypergraph_mat_{norm_type}_topk_{str(args.topk)}.pth")
-    #     print("End Load I2I multi-media Hypergraph mat:[%.1fs](" % (time() - t) + norm_type + ")")
-    #     return Hypergraph
-    #
-    # def get_I2I_Hypergraph_mul_mat(self, norm_type="sym"):
-    #     # I2I_Hypergraph_mat*I2I_Hypergraph_mat.T use sys normalization
-    #     print(f"Loading I2I multi-media Hypergraph mul mat*mat.T:({norm_type})_topk:{str(args.topk)}")
-    #     t = time()
-    #     try:
-    #         Hypergraph_mul = torch.load(f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth")
-    #     except Exception:
-    #         Hypergraph = self.get_I2I_Hypergrah_mat("origin")
-    #         Hypergraph_mul = torch.sparse.mm(Hypergraph, Hypergraph.to_dense().T)
-    #         Hypergraph_mul = self.norm_dense(Hypergraph_mul, norm_type)
-    #         Hypergraph_mul = Hypergraph_mul.to_sparse()
-    #         torch.save(Hypergraph_mul, f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth")
-    #     print("End Load I2I multi-media Hypergraph mul mat*mat.T:[%.1fs](" % (time() - t) + norm_type + ")")
-    #     return Hypergraph_mul
-
-    #pytorch---------------------------------------------------------------------------------------------------------------
-    def get_I2I_Hypergrah_mat_pt(self, norm_type="origin"):
-        # I2I_Hypergraph_mat use origin normalization
-        print("Loading I2I multi-media Hypergraph mat:(" + norm_type + ")")
-        t = time()
-        try:
-            Hypergraph = torch.load(self.path + '/hypergraph_mat_' + norm_type + ".pth")
-        except Exception:
-            image_feats = torch.load("../data/{}/img_feat.pt".format(args.dataset))
-            text_feats=torch.load("../data/{}/text_feat.pt".format(args.dataset))
-
-            # image_feats = torch.tensor(image_feats).float()
-            # text_feats = torch.tensor(text_feats).float()
-
-            # image_adj = self.build_sim_feature_nan(image_feats)
-            image_adj = self.build_sim(image_feats)
-            image_adj = self.build_knn_normalized_graph(image_adj, topk=args.topk)
-
-            # text_adj = self.build_sim_feature_nan(text_feats)
-            text_adj = self.build_sim(text_feats)
-            text_adj = self.build_knn_normalized_graph(text_adj, topk=args.topk)
-
-            Hypergraph = torch.cat((image_adj, text_adj), dim=1)
-            Hypergraph = self.norm_dense(Hypergraph, norm_type)
-            Hypergraph = Hypergraph.to_sparse()
-            torch.save(Hypergraph, self.path + '/hypergraph_mat_' + norm_type + ".pth")
-        print("End Load I2I multi-media Hypergraph mat:[%.1fs](" % (time() - t) + norm_type + ")")
-        return Hypergraph
-    #pytorch
-    def get_I2I_Hypergraph_mul_mat_pt(self,norm_type="sym"):
-        # I2I_Hypergraph_mat*I2I_Hypergraph_mat.T use sys normalization
-        print("Loading I2I multi-media Hypergraph mul mat*mat.T pytorch:(" + norm_type + ")")
-        t = time()
-        try:
-            Hypergraph_mul = torch.load(self.path + '/hypergraph_mat_mul' + norm_type + ".pth")
-        except Exception:
-            Hypergraph = self.get_I2I_Hypergrah_mat_pt("origin")
-            Hypergraph_mul = torch.sparse.mm(Hypergraph, Hypergraph.to_dense().T)
-            Hypergraph_mul = self.norm_dense(Hypergraph_mul, norm_type)
-            Hypergraph_mul = Hypergraph_mul.to_sparse()
-            torch.save(Hypergraph_mul, self.path + '/hypergraph_mat_mul' + norm_type + ".pth")
-        print("End Load I2I multi-media Hypergraph mul mat*mat.T pytorch:[%.1fs](" % (time() - t) + norm_type + ")")
-        return Hypergraph_mul
-    #---------------------------------------------------------------------------------------------------------------------
-
-    # Order to speed up when Model forward this is be replaced
-    def get_tiktok_I2I_Hypergrah_mat(self, norm_type="origin"):
-        # I2I_Hypergraph_mat use origin normalization
-        print(f"Loading I2I multi-media Hypergraph mat:({ norm_type })_topk:{str(args.topk)}")
-        t = time()
-        try:
-            Hypergraph = torch.load(f"{self.path}/hypergraph_mat_{norm_type}_topk_{str(args.topk)}.pth")
-        except Exception:
-            # image_feats = np.load('../data/old/{}/image_feat.npy'.format(args.dataset))  # '../data/{}/image_feat.npy'
-            # text_feats = np.load('../data/old/{}/text_feat.npy'.format(args.dataset))
-            # audio_feats = np.load('../data/old/{}/audio_feat.npy'.format(args.dataset))
-            image_feats = np.load('../data/{}/image_feat.npy'.format(args.dataset))  # '../data/{}/image_feat.npy'
-            text_feats = np.load('../data/{}/text_feat.npy'.format(args.dataset))
-            audio_feats = np.load('../data/{}/audio_feat.npy'.format(args.dataset))
-
-            image_feats = torch.tensor(image_feats).float()
-            text_feats = torch.tensor(text_feats).float()
-            audio_feats = torch.tensor(audio_feats).float()
-
-            image_adj = self.build_sim(image_feats)
-            image_adj = self.build_knn_normalized_graph(image_adj, topk=args.topk)
-
-            text_adj = self.build_sim(text_feats)
-            text_adj = self.build_knn_normalized_graph(text_adj, topk=args.topk)
-
-            audio_adj = self.build_sim(audio_feats)
-            audio_adj = self.build_knn_normalized_graph(audio_adj, topk=args.topk)
-
-            Hypergraph = torch.cat((torch.cat((image_adj, text_adj), dim=1), audio_adj), dim=1)
-            Hypergraph = self.norm_dense(Hypergraph, norm_type)
-            Hypergraph = Hypergraph.to_sparse()
-            torch.save(Hypergraph, f"{self.path}/hypergraph_mat_{norm_type}_topk_{str(args.topk)}.pth")
-        print("End Load I2I multi-media Hypergraph mat:[%.1fs](" % (time() - t) + norm_type + ")")
-        return Hypergraph
-
-    def get_tiktok_I2I_Hypergraph_mul_mat(self, norm_type="sym"):
-        # I2I_Hypergraph_mat*I2I_Hypergraph_mat.T use sys normalization
+    def get_I2I_Hypergraph_mul_mat(self, norm_type="sym"):
+        """
+        [Memory Optimized] 获取多模态超图乘积 (H * H^T)
+        """
         print(f"Loading I2I multi-media Hypergraph mul mat*mat.T:({norm_type})_topk:{str(args.topk)}")
         t = time()
         try:
             Hypergraph_mul = torch.load(f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth")
         except Exception:
-            Hypergraph = self.get_tiktok_I2I_Hypergrah_mat("origin")
-            Hypergraph_mul = torch.sparse.mm(Hypergraph, Hypergraph.to_dense().T)
-            Hypergraph_mul = self.norm_dense(Hypergraph_mul, norm_type)
-            Hypergraph_mul = Hypergraph_mul.to_sparse()
+            # 1. 获取各个模态的 KNN 矩阵 (List of Sparse Tensors)
+            image_adj, text_adj, _ = self.get_I2I_single_mat("origin")  # Use origin for hypergraph construction
+
+            # 2. 转回 Scipy Sparse 进行拼接
+            def torch_to_scipy(t_sparse):
+                idx = t_sparse.coalesce().indices().cpu().numpy()
+                val = t_sparse.coalesce().values().cpu().numpy()
+                return sp.coo_matrix((val, (idx[0], idx[1])), shape=t_sparse.shape)
+
+            img_sp = torch_to_scipy(image_adj)
+            txt_sp = torch_to_scipy(text_adj)
+
+            # 3. 拼接 H = [H_v, H_t]
+            H = sp.hstack([img_sp, txt_sp]).tocsr()
+
+            # 4. 计算 H * H^T
+            H_mul = H.dot(H.T)
+
+            # 5. 归一化
+            H_mul = self.norm_sparse(H_mul, norm_type)
+
+            # 6. 转回 Torch
+            H_mul = H_mul.tocoo()
+            indices = torch.from_numpy(np.vstack((H_mul.row, H_mul.col)).astype(np.int64))
+            values = torch.from_numpy(H_mul.data).float()
+            Hypergraph_mul = torch.sparse_coo_tensor(indices, values, torch.Size(H_mul.shape), dtype=torch.float32)
+
             torch.save(Hypergraph_mul, f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth")
+
         print("End Load I2I multi-media Hypergraph mul mat*mat.T:[%.1fs](" % (time() - t) + norm_type + ")")
         return Hypergraph_mul
 
+    # ============================================================================
+    # PyG HeteroData 构建 (关键修复)
+    # ============================================================================
+
+    def get_pyg_hetero_data(self):
+        """
+        构建 PyG 的 HeteroData 对象，用于异质图神经网络 (如 HGT)
+        """
+        print("Constructing PyG HeteroData...")
+        data = HeteroData()
+
+        # 1. 节点数量
+        data['user'].num_nodes = self.n_users
+        data['item'].num_nodes = self.n_items
+
+        # 2. 构建 User-Item 边
+        if len(self.trainUser) == 0:
+            print("Error: Train lists are empty. Make sure __init__ loaded json correctly.")
+
+        ui_edge_index = torch.tensor([self.trainUser, self.trainItem], dtype=torch.long)
+        data['user', 'interacts', 'item'].edge_index = ui_edge_index
+        # 添加反向边 (Item -> User)
+        data['item', 'rev_interacts', 'user'].edge_index = ui_edge_index.flip([0])
+
+        # 3. 构建 Item-Item 语义边 (从 KNN 图中提取)
+        # 确保加载了 KNN 图
+        img_adj, txt_adj, _ = self.get_I2I_single_mat(norm_type="origin")  # 获取未归一化的邻接关系
+
+        if img_adj is not None:
+            # torch.sparse -> edge_index
+            indices = img_adj.coalesce().indices()
+            data['item', 'visual_sim', 'item'].edge_index = indices
+
+        if txt_adj is not None:
+            indices = txt_adj.coalesce().indices()
+            data['item', 'text_sim', 'item'].edge_index = indices
+
+        return data
+
+    # [务必保留] 获取 SparseGraph 用于 LightGCN 兼容
+    def getSparseGraph(self):
+        return self.get_UI_mat()
 
     def build_sim(self, context):
         context_norm = context.div(torch.norm(context, p=2, dim=-1, keepdim=True))
         sim = torch.mm(context_norm, context_norm.transpose(1, 0))
         return sim
-
-    def build_sim_feature_nan(self, context):
-        #image feature extract when url is unvalid or image is destroy features=0,if use norm will nan
-        context_norm = context.div(torch.norm(context, p=2, dim=-1, keepdim=True))
-        context_norm[context_norm.isnan()] = 0
-        sim = torch.mm(context, context.transpose(1, 0))
-        return sim
-
-    def build_knn_normalized_graph(self, adj, topk):
-        knn_val, knn_ind = torch.topk(adj, topk, dim=-1)
-        adj = (torch.zeros_like(adj)).scatter_(-1, knn_ind, knn_val)
-        adj[adj > 0] = 1.
-        return adj

@@ -1,12 +1,8 @@
-import codes.utility.metrics as metrics
-from codes.utility.parser import parse_args
-from codes.utility.load_data import Data
-import multiprocessing
-import heapq
+import utility.metrics as metrics
+from utility.parser import parse_args
+from utility.load_data import Data
 import torch
 import numpy as np
-
-cores = multiprocessing.cpu_count() // 5
 
 args = parse_args()
 Ks = eval(args.Ks)
@@ -16,152 +12,140 @@ USR_NUM, ITEM_NUM = data_generator.n_users, data_generator.n_items
 N_TRAIN, N_TEST = data_generator.n_train, data_generator.n_test
 BATCH_SIZE = args.batch_size
 
-def ranklist_by_heapq(user_pos_test, test_items, rating, Ks):
-    item_score = {}
-    for i in test_items:
-        item_score[i] = rating[i]
-
-    K_max = max(Ks)
-    K_max_item_score = heapq.nlargest(K_max, item_score, key=item_score.get)
-
-    r = []
-    for i in K_max_item_score:
-        if i in user_pos_test:
-            r.append(1)
-        else:
-            r.append(0)
-    auc = 0.
-    return r, auc
-
-def get_auc(item_score, user_pos_test):
-    item_score = sorted(item_score.items(), key=lambda kv: kv[1])
-    item_score.reverse()
-    item_sort = [x[0] for x in item_score]
-    posterior = [x[1] for x in item_score]
-
-    r = []
-    for i in item_sort:
-        if i in user_pos_test:
-            r.append(1)
-        else:
-            r.append(0)
-    auc = metrics.auc(ground_truth=r, prediction=posterior)
-    return auc
-
-def ranklist_by_sorted(user_pos_test, test_items, rating, Ks):
-    item_score = {}
-    for i in test_items:
-        item_score[i] = rating[i]
-
-    K_max = max(Ks)
-    K_max_item_score = heapq.nlargest(K_max, item_score, key=item_score.get)
-
-    r = []
-    for i in K_max_item_score:
-        if i in user_pos_test:
-            r.append(1)
-        else:
-            r.append(0)
-    auc = get_auc(item_score, user_pos_test)
-    return r, auc
-
-def get_performance(user_pos_test, r, auc, Ks):
-    precision, recall, ndcg, hit_ratio = [], [], [], []
-
-    for K in Ks:
-        precision.append(metrics.precision_at_k(r, K))
-        recall.append(metrics.recall_at_k(r, K, len(user_pos_test)))
-        ndcg.append(metrics.ndcg_at_k(r, K))
-        hit_ratio.append(metrics.hit_at_k(r, K))
-
-    return {'recall': np.array(recall), 'precision': np.array(precision),
-            'ndcg': np.array(ndcg), 'hit_ratio': np.array(hit_ratio), 'auc': auc}
-
-
-def test_one_user(x):
-    # user u's ratings for user u
-    is_val = x[-1]
-    rating = x[0]
-    #uid
-    u = x[1]
-    #user u's items in the training set
-    try:
-        training_items = data_generator.train_items[u]
-    except Exception:
-        training_items = []
-    #user u's items in the test set
-    if is_val:
-        user_pos_test = data_generator.val_set[u]
-    else:
-        user_pos_test = data_generator.test_set[u]
-
-    all_items = set(range(ITEM_NUM))
-
-    test_items = list(all_items - set(training_items))
-
-    if args.test_flag == 'part':
-        r, auc = ranklist_by_heapq(user_pos_test, test_items, rating, Ks)
-    else:
-        r, auc = ranklist_by_sorted(user_pos_test, test_items, rating, Ks)
-
-    return get_performance(user_pos_test, r, auc, Ks)
-
 
 def test_torch(ua_embeddings, ia_embeddings, users_to_test, is_val, drop_flag=False, batch_test_flag=False):
     result = {'precision': np.zeros(len(Ks)), 'recall': np.zeros(len(Ks)), 'ndcg': np.zeros(len(Ks)),
               'hit_ratio': np.zeros(len(Ks)), 'auc': 0.}
-    pool = multiprocessing.Pool(cores)
 
-    u_batch_size = BATCH_SIZE * 2
-    i_batch_size = BATCH_SIZE
-
+    u_batch_size = BATCH_SIZE
     test_users = users_to_test
     n_test_users = len(test_users)
     n_user_batchs = n_test_users // u_batch_size + 1
+
+    # 确定最大的K值，用于GPU上的TopK筛选
+    max_K = max(Ks)
+
     count = 0
+
+    # 将Item Embeddings转置，准备进行矩阵乘法
+    # shape: (embedding_dim, n_items)
+    ia_embeddings = ia_embeddings.t()
 
     for u_batch_id in range(n_user_batchs):
         start = u_batch_id * u_batch_size
         end = (u_batch_id + 1) * u_batch_size
         user_batch = test_users[start: end]
-        if batch_test_flag:
-            n_item_batchs = ITEM_NUM // i_batch_size + 1
-            rate_batch = np.zeros(shape=(len(user_batch), ITEM_NUM))
 
-            i_count = 0
-            for i_batch_id in range(n_item_batchs):
-                i_start = i_batch_id * i_batch_size
-                i_end = min((i_batch_id + 1) * i_batch_size, ITEM_NUM)
+        if len(user_batch) == 0:
+            continue
 
-                item_batch = range(i_start, i_end)
-                u_g_embeddings = ua_embeddings[user_batch]
-                i_g_embeddings = ia_embeddings[item_batch]
-                i_rate_batch = torch.matmul(u_g_embeddings, torch.transpose(i_g_embeddings, 0, 1))
+        # 1. 计算分数 (GPU Matrix Multiplication)
+        # u_g_embeddings: (batch_size, dim)
+        # rate_batch: (batch_size, n_items)
+        u_g_embeddings = ua_embeddings[user_batch]
+        rate_batch = torch.matmul(u_g_embeddings, ia_embeddings)
 
-                rate_batch[:, i_start: i_end] = i_rate_batch
-                i_count += i_rate_batch.shape[1]
+        # 2. 屏蔽训练集中的物品 (Filter out training items)
+        # 将训练集物品的分数设为极小值，使其不会出现在TopK中
+        for i, user_id in enumerate(user_batch):
+            try:
+                train_items = data_generator.train_items[user_id]
+                # 注意：这里直接在GPU tensor上操作
+                rate_batch[i][train_items] = -1e9
+            except Exception:
+                pass
 
-            assert i_count == ITEM_NUM
+        # 3. GPU Top-K (加速核心)
+        # 不再将全量数据传回CPU排序，而是直接在GPU取TopK
+        _, top_k_indices = torch.topk(rate_batch, max_K)
 
+        # 将TopK索引转回CPU进行metric计算
+        top_k_indices = top_k_indices.cpu().numpy()
+
+        # 4. 计算 Metrics
+        # 这一步在CPU上进行，但只处理TopK个数据，速度很快
+        for i, user_id in enumerate(user_batch):
+            # 获取该用户的真实测试集 (Ground Truth)
+            if is_val:
+                user_pos_test = data_generator.val_set.get(user_id, [])
+            else:
+                user_pos_test = data_generator.test_set.get(user_id, [])
+
+            if len(user_pos_test) == 0:
+                continue
+
+            # 生成 hit list (1 if item in ground truth else 0)
+            pred_items = top_k_indices[i]
+
+            # 优化：使用set查找加速
+            ground_truth_set = set(user_pos_test)
+            r = []
+            for item in pred_items:
+                if item in ground_truth_set:
+                    r.append(1)
+                else:
+                    r.append(0)
+
+            # 计算各项指标
+            # 注意：这里调用 metrics 库的函数，假设其接口没变
+            for k_idx, K in enumerate(Ks):
+                # 截取前K个结果
+                r_at_k = r[:K]
+
+                result['precision'][k_idx] += metrics.precision_at_k(r_at_k, K)
+                result['recall'][k_idx] += metrics.recall_at_k(r_at_k, K, len(user_pos_test))
+                result['ndcg'][k_idx] += metrics.ndcg_at_k(r_at_k, K)
+                result['hit_ratio'][k_idx] += metrics.hit_at_k(r_at_k, K)
+
+            # AUC通常需要负样本或全排序，TopK优化下计算全量AUC会很慢。
+            # 这里如果不做全量排序，AUC通常设为0或仅在需要时单独计算。
+            # 考虑到速度，此处暂略过AUC或保持为0，如果必须计算建议单独抽样。
+            result['auc'] += 0.
+
+        count += len(user_batch)
+
+    # 计算平均值
+    if count > 0:
+        result['precision'] /= count
+        result['recall'] /= count
+        result['ndcg'] /= count
+        result['hit_ratio'] /= count
+        result['auc'] /= count
+
+    return result
+
+
+def Test(dataset, model, device, args):
+    # 1. 切换模式
+    model.eval()
+
+    # 2. 获取所有用户的 User 和 Item Embedding
+    # 对于 HeteroMMHAC，我们需要传入 pyg_data 全图进行推断
+    # main.py 中的 Trainer 已经处理了 get_pyg_hetero_data
+    # 但由于 Test 函数接口限制，通常我们在 Main 中已经跑过一次 forward 获取了 embedding，或者在这里跑
+
+    with torch.no_grad():
+        # 假设 model 是 HeteroMMHAC 实例
+        # 注意：这里需要传入 data_generator 中的 PyG 数据
+        # 为了方便，我们在 Trainer 中调用 test 时，应该传递 embedding 进来，或者让 model 内部缓存
+
+        if hasattr(model, 'pyg_data'):
+            # 如果你在 Trainer 里把 pyg_data 绑到了 model 上
+            pyg_data_gpu = model.pyg_data
         else:
-            item_batch = range(ITEM_NUM)
-            u_g_embeddings = ua_embeddings[user_batch]
-            i_g_embeddings = ia_embeddings[item_batch]
-            rate_batch = torch.matmul(u_g_embeddings, torch.transpose(i_g_embeddings, 0, 1))
+            # 重新构建或从 dataset 获取 (较慢，建议优化)
+            pyg_data = dataset.get_pyg_hetero_data()
+            pyg_data_gpu = pyg_data.to(device)
 
-        rate_batch = rate_batch.detach().cpu().numpy()
-        user_batch_rating_uid = zip(rate_batch, user_batch, [is_val] * len(user_batch))
+        # 获取全量 Embedding
+        # [Fix] 使用 *rest 忽略后面所有的返回值，这样无论 forward 返回 4 个还是 5 个都能兼容
+        ua_embeddings, ia_embeddings, *rest = model.forward(pyg_data_gpu)
 
-        batch_result = pool.map(test_one_user, user_batch_rating_uid)
-        count += len(batch_result)
+    # 3. 准备测试用户列表
+    test_users = list(dataset.test_set.keys())
 
-        for re in batch_result:
-            result['precision'] += re['precision'] / n_test_users
-            result['recall'] += re['recall'] / n_test_users
-            result['ndcg'] += re['ndcg'] / n_test_users
-            result['hit_ratio'] += re['hit_ratio'] / n_test_users
-            result['auc'] += re['auc'] / n_test_users
+    # 4. 执行测试
+    # 调用你之前优化的 test_torch
+    result = test_torch(ua_embeddings, ia_embeddings, test_users, is_val=False)
 
-    assert count == n_test_users
-    pool.close()
     return result
